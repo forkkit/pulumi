@@ -18,7 +18,6 @@ import (
 	"fmt"
 
 	"github.com/pkg/errors"
-	"github.com/pulumi/pulumi/pkg/workspace"
 	"github.com/spf13/cobra"
 
 	"github.com/pulumi/pulumi/pkg/backend/display"
@@ -47,9 +46,11 @@ func newStackInitCmd() *cobra.Command {
 			"`--secrets-provider` flag.\n" +
 			"\n" +
 			"To use the `passphrase` secrets provider with the pulumi.com backend, use:\n" +
+			"\n" +
 			"* `pulumi stack init --secrets-provider=passphrase`\n" +
 			"\n" +
 			"To use a cloud secrets provider with any backend, use one of the following:\n" +
+			"\n" +
 			"* `pulumi stack init --secrets-provider=\"awskms://alias/ExampleAlias?region=us-east-1\"`\n" +
 			"* `pulumi stack init --secrets-provider=\"awskms://1234abcd-12ab-34cd-56ef-1234567890ab?region=us-east-1\"`\n" +
 			"* `pulumi stack init --secrets-provider=\"azurekeyvault://mykeyvaultname.vault.azure.net/keys/mykeyname\"`\n" +
@@ -85,7 +86,7 @@ func newStackInitCmd() *cobra.Command {
 						"use the format <org-name>/<stack-name> (e.g. `acmecorp/dev`).\n")
 				}
 
-				name, nameErr := promptForValue(false, "stack name", "dev", false, workspace.ValidateStackName, opts)
+				name, nameErr := promptForValue(false, "stack name", "dev", false, b.ValidateStackName, opts)
 				if nameErr != nil {
 					return nameErr
 				}
@@ -94,6 +95,10 @@ func newStackInitCmd() *cobra.Command {
 
 			if stackName == "" {
 				return errors.New("missing stack name")
+			}
+
+			if err := b.ValidateStackName(stackName); err != nil {
+				return err
 			}
 
 			stackRef, err := b.ParseStackReference(stackName)

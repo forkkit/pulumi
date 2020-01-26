@@ -15,12 +15,16 @@
 package plugin
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/blang/semver"
 	pbempty "github.com/golang/protobuf/ptypes/empty"
 	"github.com/pkg/errors"
+	"google.golang.org/grpc/codes"
+
 	"github.com/pulumi/pulumi/pkg/apitype"
 	"github.com/pulumi/pulumi/pkg/resource"
 	"github.com/pulumi/pulumi/pkg/tokens"
@@ -56,8 +60,8 @@ func NewAnalyzer(host Host, ctx *Context, name tokens.QName) (Analyzer, error) {
 		})
 	}
 
-	plug, err := newPlugin(ctx, path, fmt.Sprintf("%v (analyzer)", name),
-		[]string{host.ServerAddr(), ctx.Pwd})
+	plug, err := newPlugin(ctx, ctx.Pwd, path, fmt.Sprintf("%v (analyzer)", name),
+		[]string{host.ServerAddr(), ctx.Pwd}, nil /*env*/)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +79,7 @@ const policyAnalyzerName = "policy"
 
 // NewPolicyAnalyzer boots the nodejs analyzer plugin located at `policyPackpath`
 func NewPolicyAnalyzer(
-	host Host, ctx *Context, name tokens.QName, policyPackPath string) (Analyzer, error) {
+	host Host, ctx *Context, name tokens.QName, policyPackPath string, opts *PolicyAnalyzerOptions) (Analyzer, error) {
 
 	// Load the policy-booting analyzer plugin (i.e., `pulumi-analyzer-${policyAnalyzerName}`).
 	_, pluginPath, err := workspace.GetPluginPath(
@@ -83,17 +87,32 @@ func NewPolicyAnalyzer(
 	if err != nil {
 		return nil, rpcerror.Convert(err)
 	} else if pluginPath == "" {
-		return nil, fmt.Errorf("could not start policy pack %s because the built-in analyzer "+
+		return nil, fmt.Errorf("could not start policy pack %q because the built-in analyzer "+
 			"plugin that runs policy plugins is missing. This might occur when the plugin "+
 			"directory is not on your $PATH, or when the installed version of the Pulumi SDK "+
 			"does not support resource policies", string(name))
 	}
 
-	plug, err := newPlugin(ctx, pluginPath, fmt.Sprintf("%v (analyzer)", name),
-		[]string{host.ServerAddr(), policyPackPath})
+	// Create the environment variables from the options.
+	env, err := constructEnv(opts)
 	if err != nil {
-		return nil, errors.Wrapf(err,
-			"policy pack %s failed to start because of an internal error", string(name))
+		return nil, err
+	}
+
+	// The `pulumi-analyzer-policy` plugin is a script that looks for the '@pulumi/pulumi/cmd/run-policy-pack'
+	// node module and runs it with node. To allow non-node Pulumi programs (e.g. Python, .NET, Go, etc.) to
+	// run node policy packs, we must set the plugin's pwd to the policy pack directory instead of the Pulumi
+	// program directory, so that the '@pulumi/pulumi/cmd/run-policy-pack' module from the policy pack's
+	// node_modules is used.
+	pwd := policyPackPath
+	plug, err := newPlugin(ctx, pwd, pluginPath, fmt.Sprintf("%v (analyzer)", name),
+		[]string{host.ServerAddr(), "."}, env)
+	if err != nil {
+		if err == errRunPolicyModuleNotFound {
+			return nil, fmt.Errorf("it looks like the policy pack's dependencies are not installed; "+
+				"try running npm install or yarn install in %q", policyPackPath)
+		}
+		return nil, errors.Wrapf(err, "policy pack %q failed to start", string(name))
 	}
 	contract.Assertf(plug != nil, "unexpected nil analyzer plugin for %s", name)
 
@@ -113,8 +132,8 @@ func (a *analyzer) label() string {
 }
 
 // Analyze analyzes a single resource object, and returns any errors that it finds.
-func (a *analyzer) Analyze(
-	t tokens.Type, props resource.PropertyMap) ([]AnalyzeDiagnostic, error) {
+func (a *analyzer) Analyze(r AnalyzerResource) ([]AnalyzeDiagnostic, error) {
+	urn, t, name, props := r.URN, r.Type, r.Name, r.Properties
 
 	label := fmt.Sprintf("%s.Analyze(%s)", a.label(), t)
 	logging.V(7).Infof("%s executing (#props=%d)", label, len(props))
@@ -124,7 +143,9 @@ func (a *analyzer) Analyze(
 	}
 
 	resp, err := a.client.Analyze(a.ctx.Request(), &pulumirpc.AnalyzeRequest{
+		Urn:        string(urn),
 		Type:       string(t),
+		Name:       string(name),
 		Properties: mprops,
 	})
 	if err != nil {
@@ -136,24 +157,56 @@ func (a *analyzer) Analyze(
 	failures := resp.GetDiagnostics()
 	logging.V(7).Infof("%s success: failures=#%d", label, len(failures))
 
-	diags := []AnalyzeDiagnostic{}
-	for _, failure := range failures {
-		enforcementLevel, err := convertEnforcementLevel(failure.EnforcementLevel)
+	diags, err := convertDiagnostics(failures)
+	if err != nil {
+		return nil, errors.Wrap(err, "converting analysis results")
+	}
+	return diags, nil
+}
+
+// AnalyzeStack analyzes all resources in a stack at the end of the update operation.
+func (a *analyzer) AnalyzeStack(resources []AnalyzerResource) ([]AnalyzeDiagnostic, error) {
+	logging.V(7).Infof("%s.AnalyzeStack(#resources=%d) executing", a.label(), len(resources))
+
+	protoResources := make([]*pulumirpc.AnalyzerResource, len(resources))
+	for idx, resource := range resources {
+		props, err := MarshalProperties(resource.Properties, MarshalOptions{KeepUnknowns: true, KeepSecrets: true})
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "marshalling properties")
 		}
 
-		diags = append(diags, AnalyzeDiagnostic{
-			PolicyName:        failure.PolicyName,
-			PolicyPackName:    failure.PolicyPackName,
-			PolicyPackVersion: failure.PolicyPackVersion,
-			Description:       failure.Description,
-			Message:           failure.Message,
-			Tags:              failure.Tags,
-			EnforcementLevel:  enforcementLevel,
-		})
+		protoResources[idx] = &pulumirpc.AnalyzerResource{
+			Urn:        string(resource.URN),
+			Type:       string(resource.Type),
+			Name:       string(resource.Name),
+			Properties: props,
+		}
 	}
 
+	resp, err := a.client.AnalyzeStack(a.ctx.Request(), &pulumirpc.AnalyzeStackRequest{
+		Resources: protoResources,
+	})
+	if err != nil {
+		rpcError := rpcerror.Convert(err)
+		// Handle the case where we the policy pack doesn't implement a recent enough
+		// AnalyzerService to support the AnalyzeStack method. Ignore the error as it
+		// just means the analyzer isn't capable of this specific type of check.
+		if rpcError.Code() == codes.Unimplemented {
+			logging.V(7).Infof("%s.AnalyzeStack(...) is unimplemented, skipping: err=%v", a.label(), rpcError)
+			return nil, nil
+		}
+
+		logging.V(7).Infof("%s.AnalyzeStack(...) failed: err=%v", a.label(), rpcError)
+		return nil, rpcError
+	}
+
+	failures := resp.GetDiagnostics()
+	logging.V(7).Infof("%s.AnalyzeStack(...) success: failures=#%d", a.label(), len(failures))
+
+	diags, err := convertDiagnostics(failures)
+	if err != nil {
+		return nil, errors.Wrap(err, "converting analysis results")
+	}
 	return diags, nil
 }
 
@@ -234,4 +287,75 @@ func convertEnforcementLevel(el pulumirpc.EnforcementLevel) (apitype.Enforcement
 	default:
 		return "", fmt.Errorf("Invalid enforcement level %d", el)
 	}
+}
+
+func convertDiagnostics(protoDiagnostics []*pulumirpc.AnalyzeDiagnostic) ([]AnalyzeDiagnostic, error) {
+	diagnostics := make([]AnalyzeDiagnostic, len(protoDiagnostics))
+	for idx := range protoDiagnostics {
+		protoD := protoDiagnostics[idx]
+
+		enforcementLevel, err := convertEnforcementLevel(protoD.EnforcementLevel)
+		if err != nil {
+			return nil, err
+		}
+
+		diagnostics[idx] = AnalyzeDiagnostic{
+			PolicyName:        protoD.PolicyName,
+			PolicyPackName:    protoD.PolicyPackName,
+			PolicyPackVersion: protoD.PolicyPackVersion,
+			Description:       protoD.Description,
+			Message:           protoD.Message,
+			Tags:              protoD.Tags,
+			EnforcementLevel:  enforcementLevel,
+			URN:               resource.URN(protoD.Urn),
+		}
+	}
+
+	return diagnostics, nil
+}
+
+// constructEnv creates a slice of key/value pairs to be used as the environment for the policy pack process. Each entry
+// is of the form "key=value". Config is passed as an environment variable (including unecrypted secrets), similar to
+// how config is passed to each language runtime plugin.
+func constructEnv(opts *PolicyAnalyzerOptions) ([]string, error) {
+	env := os.Environ()
+
+	maybeAppendEnv := func(k, v string) {
+		if v != "" {
+			env = append(env, k+"="+v)
+		}
+	}
+
+	config, err := constructConfig(opts)
+	if err != nil {
+		return nil, err
+	}
+	maybeAppendEnv("PULUMI_CONFIG", config)
+
+	if opts != nil {
+		maybeAppendEnv("PULUMI_NODEJS_PROJECT", opts.Project)
+		maybeAppendEnv("PULUMI_NODEJS_STACK", opts.Stack)
+		maybeAppendEnv("PULUMI_NODEJS_DRY_RUN", fmt.Sprintf("%v", opts.DryRun))
+	}
+
+	return env, nil
+}
+
+// constructConfig JSON-serializes the configuration data.
+func constructConfig(opts *PolicyAnalyzerOptions) (string, error) {
+	if opts == nil || opts.Config == nil {
+		return "", nil
+	}
+
+	config := make(map[string]string)
+	for k, v := range opts.Config {
+		config[k.String()] = v
+	}
+
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return "", err
+	}
+
+	return string(configJSON), nil
 }

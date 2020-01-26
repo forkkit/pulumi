@@ -15,6 +15,7 @@
 package providers
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/blang/semver"
@@ -53,7 +54,8 @@ func (host *testPluginHost) LogStatus(sev diag.Severity, urn resource.URN, msg s
 func (host *testPluginHost) Analyzer(nm tokens.QName) (plugin.Analyzer, error) {
 	return nil, errors.New("unsupported")
 }
-func (host *testPluginHost) PolicyAnalyzer(name tokens.QName, path string) (plugin.Analyzer, error) {
+func (host *testPluginHost) PolicyAnalyzer(name tokens.QName, path string,
+	opts *plugin.PolicyAnalyzerOptions) (plugin.Analyzer, error) {
 	return nil, errors.New("unsupported")
 }
 func (host *testPluginHost) ListAnalyzers() []plugin.Analyzer {
@@ -141,6 +143,12 @@ func (prov *testProvider) Delete(urn resource.URN,
 func (prov *testProvider) Invoke(tok tokens.ModuleMember,
 	args resource.PropertyMap) (resource.PropertyMap, []plugin.CheckFailure, error) {
 	return nil, nil, errors.New("unsupported")
+}
+func (prov *testProvider) StreamInvoke(
+	tok tokens.ModuleMember, args resource.PropertyMap,
+	onNext func(resource.PropertyMap) error) ([]plugin.CheckFailure, error) {
+
+	return nil, fmt.Errorf("not implemented")
 }
 func (prov *testProvider) GetPluginInfo() (workspace.PluginInfo, error) {
 	return workspace.PluginInfo{

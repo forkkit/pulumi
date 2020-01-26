@@ -3,6 +3,8 @@
 **/node_modules/
 **/bin
 **/.vscode/
+**/.vs/
+**/.ionide/
 coverage.cov
 *.coverprofile
 

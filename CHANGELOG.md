@@ -1,7 +1,259 @@
 CHANGELOG
 =========
 
-## HEAD (Unreleased)
+## HEAD (unreleased)
+- Fix a stack reference regression in the Python SDK.
+  [#3798](https://github.com/pulumi/pulumi/pull/3798)
+
+- Fix a buggy assertion in the Go SDK.
+  [#3794](https://github.com/pulumi/pulumi/pull/3794)
+
+- Add `--latest` flag to `pulumi policy enable`.
+
+- Breaking change for Policy which removes requirement for version when running `pulumi policy disable`. Add `--version` flag if user wants to specify version of Policy Pack to disable.
+
+- Fix rendering of Policy Packs to ensure they are always displayed.
+
+- Primitive input types in the Go SDK (e.g. Int, String, etc.) now implement the corresponding Ptr type e.g. IntPtr,
+  StringPtr, etc.). This is consistent with the output of the Go code generator and is much more ergonomic for
+  optional inputs than manually converting to pointer types.
+  [#3806](https://github.com/pulumi/pulumi/pull/3806)
+
+## 1.9.0 (2020-01-22)
+- Publish python types for PEP 561
+  [#3704](https://github.com/pulumi/pulumi/pull/3704)
+
+- Lock dep ts-node to v8.5.4
+  [#3733](https://github.com/pulumi/pulumi/pull/3733)
+
+- Improvements to `pulumi policy` functionality. Add ability to remove & disable Policy Packs.
+
+- Breaking change for Policy which is in Public Preview: Change `pulumi policy apply` to `pulumi policy enable`, and allow users to specify the Policy Group.
+
+- Add Permalink to output when publishing a Policy Pack.
+
+- Add `pulumi policy ls` and `pulumi policy group ls` to list Policy related resources.
+
+- Add `BuildNumber` to CI vars and backend metadata property bag for CI systems that have separate ID and a user-friendly number. [#3766](https://github.com/pulumi/pulumi/pull/3766)
+
+- Breaking changes for the Go SDK. Complete details are in [#3506](https://github.com/pulumi/pulumi/pull/3506).
+
+## 1.8.1 (2019-12-20)
+
+- Fix a panic in `pulumi stack select`.
+  [#3687](https://github.com/pulumi/pulumi/pull/3687)
+
+## 1.8.0 (2019-12-19)
+
+- Update version of TypeScript used by Pulumi to `3.7.3`.
+  [#3627](https://github.com/pulumi/pulumi/pull/3627)
+
+- Add support for GOOGLE_CREDENTIALS when using Google Cloud Storage backend.
+  [#2906](https://github.com/pulumi/pulumi/pull/2906)
+
+  ```sh
+   export GOOGLE_CREDENTIALS="$(cat ~/service-account-credentials.json)"
+   pulumi login gs://my-bucket
+  ```
+
+
+- Support for using `Config`, `getProject()`, `getStack()`, and `isDryRun()` from Policy Packs.
+  [#3612](https://github.com/pulumi/pulumi/pull/3612)
+
+- Top-level Stack component in the .NET SDK.
+  [#3618](https://github.com/pulumi/pulumi/pull/3618)
+
+- Add the .NET Core 3.0 runtime to the `pulumi/pulumi` container.
+  [#3616](https://github.com/pulumi/pulumi/pull/3616)
+
+- Add `pulumi preview` support for `--refresh`, `--target`, `--replace`, `--target-replace` and
+  `--target-dependents` to align with `pulumi up`.
+  [#3675](https://github.com/pulumi/pulumi/pull/3675)
+  
+- `ComponentResource`s now have built-in support for asynchronously constructing their children.
+  [#3676](https://github.com/pulumi/pulumi/pull/3676)
+
+- `Output.apply` (for the JS, Python and .Net sdks) has updated semantics, and will lift dependencies from inner Outputs to the returned Output.
+  [#3663](https://github.com/pulumi/pulumi/pull/3663)
+
+- Fix bug in determining PRNumber and BuildURL for an Azure Pipelines CI environment.
+  [#3677](https://github.com/pulumi/pulumi/pull/3677)
+
+- Improvements to `pulumi policy` functionality. Add ability to remove & disable Policy Packs.
+
+- Breaking change for Policy which is in Public Preview: Change `pulumi policy apply` to `pulumi policy enable`, and allow users to specify the Policy Group.
+
+## 1.7.1 (2019-12-13)
+
+- Fix [SxS issue](https://github.com/pulumi/pulumi/issues/3652) introduced in 1.7.0 when assigning
+  `Output`s across different versions of the `@pulumi/pulumi` SDK.
+  [#3658](https://github.com/pulumi/pulumi/pull/3658)
+
+## 1.7.0 (2019-12-11)
+
+- A Pulumi JavaScript/TypeScript program can now consist of a single exported top level function. This 
+  allows for an easy approach to create a Pulumi program that needs to perform `async`/`await`
+  operations at the top-level.
+  [#3321](https://github.com/pulumi/pulumi/pull/3321)
+
+  ```ts
+  // JavaScript
+  module.exports = async () => {
+  }
+
+  //TypeScript
+  export = async () => {
+  }
+  ```
+
+## 1.6.1 (2019-11-26)
+
+- Support passing a parent and providers for `ReadResource`, `RegisterResource`, and `Invoke` in the go SDK. [#3563](https://github.com/pulumi/pulumi/pull/3563)
+
+- Fix go SDK ReadResource.
+  [#3581](https://github.com/pulumi/pulumi/pull/3581)
+
+- Fix go SDK DeleteBeforeReplace.
+  [#3572](https://github.com/pulumi/pulumi/pull/3572)
+
+- Support for setting the `PULUMI_PREFER_YARN` environment variable to opt-in to using `yarn` instead of `npm` for
+  installing Node.js dependencies.
+  [#3556](https://github.com/pulumi/pulumi/pull/3556)
+
+- Fix regression that prevented relative paths passed to `--policy-pack` from working.
+  [#3565](https://github.com/pulumi/pulumi/issues/3564)
+
+## 1.6.0 (2019-11-20)
+
+- Support for config.GetObject and related variants for Golang.
+  [#3526](https://github.com/pulumi/pulumi/pull/3526)
+
+- Add support for IgnoreChanges in the go SDK.
+  [#3514](https://github.com/pulumi/pulumi/pull/3514)
+
+- Support for a `go run` style workflow. Building or installing a pulumi program written in go is
+  now optional.
+  [#3503](https://github.com/pulumi/pulumi/pull/3503)
+
+- Re-apply "propagate resource inputs to resource state during preview, including first-class unknown values." The new
+  set of changes have additional fixes to ensure backwards compatibility with earlier code. This allows the preview to
+  better estimate the state of a resource after an update, including property values that were populated using defaults
+  calculated by the provider.
+  [#3327](https://github.com/pulumi/pulumi/pull/3327)
+
+- Validate StackName when passing a non-default secrets provider to `pulumi stack init`
+
+- Add support for go1.13.x
+
+- `pulumi update --target` and `pulumi destroy --target` will both error if they determine a
+  dependent resource needs to be updated, destroyed, or created that was not was specified in the
+  `--target` list.  To proceed with an `update/destroy` after this error, either specify all the
+  reported resources as `--target`s, or pass the `--target-dependents` flag to allow necessary
+  changes to unspecified dependent targets.
+
+- Support for node 13.x, building with gcc 8 and newer.
+  [#3512] (https://github.com/pulumi/pulumi/pull/3512)
+
+- Codepaths which could result in a hang will print a message to the console indicating the problem, along with a link
+  to documentation on how to restructure code to best address it.
+
+### Compatibility
+
+- `StackReference.getOutputSync` and `requireOutputSync` are deprecated as they may cause hangs on
+  some combinations of Node and certain OS platforms. `StackReference.getOutput` and `requireOutput`
+  should be used instead.
+
+## 1.5.2 (2019-11-13)
+
+- `pulumi policy publish` now determines the Policy Pack name from the Policy Pack, and the
+  the `org-name` CLI argument is now optional. If not specified; the current user account is
+  used.
+  [#3459](https://github.com/pulumi/pulumi/pull/3459)
+
+- Refactor the Output API in the Go SDK.
+  [#3496](https://github.com/pulumi/pulumi/pull/3496)
+
+## 1.5.1 (2019-11-06)
+
+- Include the .NET language provider in the Windows SDK.
+
+## 1.5.0 (2019-11-06)
+
+- Gracefully handle errors when resources use duplicate aliases.
+
+- Use the update token for renew_lease calls and update the API version to 5.
+  [#3348](https://github.com/pulumi/pulumi/pull/3348)
+
+- Improve startup time performance by 0.5-1s by checking for a newer CLI release in parallel.
+  [#3441](https://github.com/pulumi/pulumi/pull/3441)
+
+- Add an experimental `pulumi watch` command. 
+  [#3391](https://github.com/pulumi/pulumi/pull/3391)
+
+## 1.4.1 (2019-11-01)
+
+- Adds a **preview** of .NET support for Pulumi. This code is an preview state and is subject
+  to change at any point.
+
+- Fix another colorizer issue that could cause garbled output for messages that did not end in colorization tags.
+  [#3417](https://github.com/pulumi/pulumi/pull/3417)
+
+- Verify deployment integrity during import and issue an error if verification fails. The state file can still be
+  imported by passing the `--force` flag.
+  [#3422](https://github.com/pulumi/pulumi/pull/3422)
+
+- Omit unknowns in resources in stack outputs during preview.
+  [#3427](https://github.com/pulumi/pulumi/pull/3427)
+
+- `pulumi update` can now be instructed that a set of resources should be replaced by adding a
+  `--replace urn` argument.  Multiple resources can be specified using `--replace urn1 --replace urn2`. In order to
+  replace exactly one resource and leave other resources unchanged, invoke `pulumi update --replace urn --target urn`,
+  or `pulumi update --target-replace urn` for short.
+  [#3418](https://github.com/pulumi/pulumi/pull/3418)
+
+- `pulumi stack` now renders the stack as a tree view.
+  [#3430](https://github.com/pulumi/pulumi/pull/3430)
+
+- Support for lists and maps in config.
+  [#3342](https://github.com/pulumi/pulumi/pull/3342)
+
+- `ResourceProvider#StreamInvoke` implemented, will be the basis for streaming
+  APIs in `pulumi query`.
+  [#3424](https://github.com/pulumi/pulumi/pull/3424)
+
+## 1.4.0 (2019-10-24)
+
+- `FileAsset` in the Python SDK now accepts anything implementing `os.PathLike` in addition to `str`.
+  [#3368](https://github.com/pulumi/pulumi/pull/3368)
+
+- Fix colorization on Windows 10, and fix a colorizer bug that could cause garbled output for resources with long
+  status messages.
+  [#3385](https://github.com/pulumi/pulumi/pull/3385)
+
+## 1.3.4 (2019-10-18)
+
+- Remove unintentional console outupt introduced in 1.3.3.
+
+## 1.3.3 (2019-10-17)
+
+- Fix an issue with first-class providers introduced in 1.3.2.
+
+## 1.3.2 (2019-10-16)
+
+- Fix hangs and crashes related to use of `getResource` (i.e. `aws.ec2.getSubnetIds(...)`) methods,
+  including frequent hangs on Node.js 12. This fixes https://github.com/pulumi/pulumi/issues/3260)
+  and [hangs](https://github.com/pulumi/pulumi/issues/3309).
+
+  Some less common existing styles of using `getResource` calls are also deprecated as part of this
+  change, and users should see https://www.pulumi.com/docs/troubleshooting/#synchronous-call for
+  details on adjusting their code if needed.
+
+## 1.3.1 (2019-10-09)
+
+- Revert "propagate resource inputs to resource state during preview". These changes had a critical issue that needs
+  further investigation.
+
+## 1.3.0 (2019-10-09)
 
 - Propagate resource inputs to resource state during preview, including first-class unknown values. This allows the
   preview to better estimate the state of a resource after an update, including property values that were populated
@@ -13,6 +265,21 @@ CHANGELOG
 
 - Support renaming stack projects via `pulumi stack rename`.
   [#3292](https://github.com/pulumi/pulumi/pull/3292)
+
+- Add `helm` to `pulumi/pulumi` Dockerhub container
+  [#3294](https://github.com/pulumi/pulumi/pull/3294)
+
+- Make the location of `.pulumi` folder configurable with an environment variable.
+  [#3300](https://github.com/pulumi/pulumi/pull/3300) (Fixes [#2966](https://github.com/pulumi/pulumi/issues/2966))
+
+- `pulumi update` can now be scoped to update a single resource by adding a `--target urn` or `-t urn`
+  argument.  Multiple resources can be specified using `-t urn1 -t urn2`.
+
+- Adds the ability to provide transformations to modify the properties and resource options that
+  will be used for any child resource of a component or stack.
+  [#3174](https://github.com/pulumi/pulumi/pull/3174)
+
+- Add resource transformations support in Python. [#3319](https://github.com/pulumi/pulumi/pull/3319)
 
 ## 1.2.0 (2019-09-26)
 
@@ -28,9 +295,6 @@ CHANGELOG
 - `pulumi destroy` can now be scoped to delete a single resource (and its dependents) by adding a
   `--target urn` or `-t urn` argument.  Multiple resources can be specified using `-t urn1 -t urn2`.
 
-- `pulumi update` can now be scoped to update a single resource by adding a `--target urn` or `-t urn`
-  argument.  Multiple resources can be specified using `-t urn1 -t urn2`.
-
 - Avoid re-encrypting secret values on each checkpoint write. These changes should improve update times for stacks
   that contain secret values.
   [#3183](https://github.com/pulumi/pulumi/pull/3183)
@@ -38,10 +302,6 @@ CHANGELOG
 - Add Codefresh CI detection.
 
 - Add `-c` (config array) flag to the `preview` command.
-
-- Adds the ability to provide transformations to modify the properties and resource options that
-  will be used for any child resource of a component or stack.
-  [#3174](https://github.com/pulumi/pulumi/pull/3174)
 
 ## 1.1.0 (2019-09-11)
 

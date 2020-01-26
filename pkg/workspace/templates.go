@@ -18,14 +18,13 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 
 	"github.com/texttheater/golang-levenshtein/levenshtein"
-	git "gopkg.in/src-d/go-git.v4"
+	"gopkg.in/src-d/go-git.v4"
 	"gopkg.in/src-d/go-git.v4/plumbing"
 
 	"github.com/pkg/errors"
@@ -36,7 +35,8 @@ import (
 const (
 	defaultProjectName = "project"
 
-	pulumiTemplateGitRepository = "https://github.com/pulumi/templates.git"
+	pulumiTemplateGitRepository       = "https://github.com/pulumi/templates.git"
+	pulumiPolicyTemplateGitRepository = "https://github.com/pulumi/templates-policy.git"
 
 	// This file will be ignored when copying from the template cache to
 	// a project directory.
@@ -45,6 +45,21 @@ const (
 	// pulumiLocalTemplatePathEnvVar is a path to the folder where templates are stored.
 	// It is used in sandboxed environments where the classic template folder may not be writable.
 	pulumiLocalTemplatePathEnvVar = "PULUMI_TEMPLATE_PATH"
+
+	// pulumiLocalPolicyTemplatePathEnvVar is a path to the folder where policy templates are stored.
+	// It is used in sandboxed environments where the classic template folder may not be writable.
+	pulumiLocalPolicyTemplatePathEnvVar = "PULUMI_POLICY_TEMPLATE_PATH"
+)
+
+// TemplateKind describes the form of a template.
+type TemplateKind int
+
+const (
+	// TemplateKindPulumiProject is a template for a Pulumi stack.
+	TemplateKindPulumiProject TemplateKind = 0
+
+	// TemplateKindPolicyPack is a template for a Policy Pack.
+	TemplateKindPolicyPack TemplateKind = 1
 )
 
 // TemplateRepository represents a repository of templates.
@@ -112,6 +127,56 @@ func (repo TemplateRepository) Templates() ([]Template, error) {
 	return result, nil
 }
 
+// PolicyTemplates lists the policy templates in the repository.
+func (repo TemplateRepository) PolicyTemplates() ([]PolicyPackTemplate, error) {
+	path := repo.SubDirectory
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// If it's a file, look in its directory.
+	if !info.IsDir() {
+		path = filepath.Dir(path)
+	}
+
+	// See if there's a PulumiPolicy.yaml in the directory.
+	template, err := LoadPolicyPackTemplate(path)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	} else if err == nil {
+		return []PolicyPackTemplate{template}, nil
+	}
+
+	// Otherwise, read all subdirectories to find the ones
+	// that contain a PulumiPolicy.yaml.
+	infos, err := ioutil.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []PolicyPackTemplate
+	for _, info := range infos {
+		if info.IsDir() {
+			name := info.Name()
+
+			// Ignore the .git directory.
+			if name == GitDir {
+				continue
+			}
+
+			template, err := LoadPolicyPackTemplate(filepath.Join(path, name))
+			if err != nil && !os.IsNotExist(err) {
+				return nil, err
+			} else if err == nil {
+				result = append(result, template)
+			}
+		}
+	}
+	return result, nil
+}
+
 // Template represents a project template.
 type Template struct {
 	Dir         string                                // The directory containing Pulumi.yaml.
@@ -125,9 +190,16 @@ type Template struct {
 	ProjectDescription string // Optional description of the project.
 }
 
+// PolicyPackTemplate represents a Policy Pack template.
+type PolicyPackTemplate struct {
+	Dir         string // The directory containing PulumiPolicy.yaml.
+	Name        string // The name of the template.
+	Description string // Description of the template.
+}
+
 // cleanupLegacyTemplateDir deletes an existing ~/.pulumi/templates directory if it isn't a git repository.
-func cleanupLegacyTemplateDir() error {
-	templateDir, err := GetTemplateDir()
+func cleanupLegacyTemplateDir(templateKind TemplateKind) error {
+	templateDir, err := GetTemplateDir(templateKind)
 	if err != nil {
 		return err
 	}
@@ -158,18 +230,20 @@ func isTemplateFileOrDirectory(templateNamePathOrURL string) bool {
 }
 
 // RetrieveTemplates retrieves a "template repository" based on the specified name, path, or URL.
-func RetrieveTemplates(templateNamePathOrURL string, offline bool) (TemplateRepository, error) {
+func RetrieveTemplates(templateNamePathOrURL string, offline bool,
+	templateKind TemplateKind) (TemplateRepository, error) {
+
 	if IsTemplateURL(templateNamePathOrURL) {
-		return retrieveURLTemplates(templateNamePathOrURL, offline)
+		return retrieveURLTemplates(templateNamePathOrURL, offline, templateKind)
 	}
 	if isTemplateFileOrDirectory(templateNamePathOrURL) {
 		return retrieveFileTemplates(templateNamePathOrURL)
 	}
-	return retrievePulumiTemplates(templateNamePathOrURL, offline)
+	return retrievePulumiTemplates(templateNamePathOrURL, offline, templateKind)
 }
 
 // retrieveURLTemplates retrieves the "template repository" at the specified URL.
-func retrieveURLTemplates(rawurl string, offline bool) (TemplateRepository, error) {
+func retrieveURLTemplates(rawurl string, offline bool, templateKind TemplateKind) (TemplateRepository, error) {
 	if offline {
 		return TemplateRepository{}, errors.Errorf("cannot use %s offline", rawurl)
 	}
@@ -206,16 +280,16 @@ func retrieveFileTemplates(path string) (TemplateRepository, error) {
 // retrievePulumiTemplates retrieves the "template repository" for Pulumi templates.
 // Instead of retrieving to a temporary directory, the Pulumi templates are managed from
 // ~/.pulumi/templates.
-func retrievePulumiTemplates(templateName string, offline bool) (TemplateRepository, error) {
+func retrievePulumiTemplates(templateName string, offline bool, templateKind TemplateKind) (TemplateRepository, error) {
 	templateName = strings.ToLower(templateName)
 
 	// Cleanup the template directory.
-	if err := cleanupLegacyTemplateDir(); err != nil {
+	if err := cleanupLegacyTemplateDir(templateKind); err != nil {
 		return TemplateRepository{}, err
 	}
 
 	// Get the template directory.
-	templateDir, err := GetTemplateDir()
+	templateDir, err := GetTemplateDir(templateKind)
 	if err != nil {
 		return TemplateRepository{}, err
 	}
@@ -227,7 +301,11 @@ func retrievePulumiTemplates(templateName string, offline bool) (TemplateReposit
 
 	if !offline {
 		// Clone or update the pulumi/templates repo.
-		err := gitutil.GitCloneOrPull(pulumiTemplateGitRepository, plumbing.HEAD, templateDir, false /*shallow*/)
+		repo := pulumiTemplateGitRepository
+		if templateKind == TemplateKindPolicyPack {
+			repo = pulumiPolicyTemplateGitRepository
+		}
+		err := gitutil.GitCloneOrPull(repo, plumbing.HEAD, templateDir, false /*shallow*/)
 		if err != nil {
 			return TemplateRepository{}, err
 		}
@@ -326,14 +404,15 @@ func LoadTemplate(path string) (Template, error) {
 
 // CopyTemplateFilesDryRun does a dry run of copying a template to a destination directory,
 // to ensure it won't overwrite any files.
-func (template Template) CopyTemplateFilesDryRun(destDir string) error {
+func CopyTemplateFilesDryRun(sourceDir, destDir, projectName string) error {
 	var existing []string
-	if err := walkFiles(template.Dir, destDir, func(info os.FileInfo, source string, dest string) error {
-		if destInfo, statErr := os.Stat(dest); statErr == nil && !destInfo.IsDir() {
-			existing = append(existing, filepath.Base(dest))
-		}
-		return nil
-	}); err != nil {
+	if err := walkFiles(sourceDir, destDir, projectName,
+		func(info os.FileInfo, source string, dest string) error {
+			if destInfo, statErr := os.Stat(dest); statErr == nil && !destInfo.IsDir() {
+				existing = append(existing, filepath.Base(dest))
+			}
+			return nil
+		}); err != nil {
 		return err
 	}
 
@@ -344,64 +423,92 @@ func (template Template) CopyTemplateFilesDryRun(destDir string) error {
 }
 
 // CopyTemplateFiles does the actual copy operation to a destination directory.
-func (template Template) CopyTemplateFiles(
-	destDir string, force bool, projectName string, projectDescription string) error {
+func CopyTemplateFiles(
+	sourceDir, destDir string, force bool, projectName string, projectDescription string) error {
 
-	return walkFiles(template.Dir, destDir, func(info os.FileInfo, source string, dest string) error {
-		if info.IsDir() {
-			// Create the destination directory.
-			return os.Mkdir(dest, 0700)
-		}
-
-		// Read the source file.
-		b, err := ioutil.ReadFile(source)
-		if err != nil {
-			return err
-		}
-
-		// Transform only if it isn't a binary file.
-		result := b
-		if !isBinary(b) {
-			transformed := transform(string(b), projectName, projectDescription)
-			result = []byte(transformed)
-		}
-
-		// Write to the destination file.
-		err = writeAllBytes(dest, result, force)
-		if err != nil {
-			// An existing file has shown up in between the dry run and the actual copy operation.
-			if os.IsExist(err) {
-				return newExistingFilesError([]string{filepath.Base(dest)})
+	return walkFiles(sourceDir, destDir, projectName,
+		func(info os.FileInfo, source string, dest string) error {
+			if info.IsDir() {
+				// Create the destination directory.
+				return os.Mkdir(dest, 0700)
 			}
-		}
-		return err
-	})
+
+			// Read the source file.
+			b, err := ioutil.ReadFile(source)
+			if err != nil {
+				return err
+			}
+
+			// Transform only if it isn't a binary file.
+			result := b
+			if !isBinary(b) {
+				transformed := transform(string(b), projectName, projectDescription)
+				result = []byte(transformed)
+			}
+
+			// Write to the destination file.
+			err = writeAllBytes(dest, result, force)
+			if err != nil {
+				// An existing file has shown up in between the dry run and the actual copy operation.
+				if os.IsExist(err) {
+					return newExistingFilesError([]string{filepath.Base(dest)})
+				}
+			}
+			return err
+		})
+}
+
+// LoadPolicyPackTemplate returns a Policy Pack template from a path.
+func LoadPolicyPackTemplate(path string) (PolicyPackTemplate, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return PolicyPackTemplate{}, err
+	}
+	if !info.IsDir() {
+		return PolicyPackTemplate{}, errors.Errorf("%s is not a directory", path)
+	}
+
+	pack, err := LoadPolicyPack(filepath.Join(path, "PulumiPolicy.yaml"))
+	if err != nil {
+		return PolicyPackTemplate{}, err
+	}
+	policyPackTemplate := PolicyPackTemplate{
+		Dir:  path,
+		Name: filepath.Base(path),
+	}
+	if pack.Description != nil {
+		policyPackTemplate.Description = *pack.Description
+	}
+
+	return policyPackTemplate, nil
 }
 
 // GetTemplateDir returns the directory in which templates on the current machine are stored.
-func GetTemplateDir() (string, error) {
+func GetTemplateDir(templateKind TemplateKind) (string, error) {
+	envVar := pulumiLocalTemplatePathEnvVar
+	if templateKind == TemplateKindPolicyPack {
+		envVar = pulumiLocalPolicyTemplatePathEnvVar
+	}
 	// Allow the folder we use to store templates to be overridden.
-	dir := os.Getenv(pulumiLocalTemplatePathEnvVar)
-
-	// Use the classic template directory if there is no override.
-	if dir == "" {
-		u, err := user.Current()
-		if u == nil || err != nil {
-			return "", errors.Wrap(err, "getting user home directory")
-		}
-		dir = filepath.Join(u.HomeDir, BookkeepingDir, TemplateDir)
+	dir := os.Getenv(envVar)
+	if dir != "" {
+		return dir, nil
 	}
 
-	return dir, nil
+	// If Policy Pack template and there is no override, then return the classic policy template directory.
+	if templateKind == TemplateKindPolicyPack {
+		return GetPulumiPath(TemplatePolicyDir)
+	}
+
+	// Use the classic template directory if there is no override.
+	return GetPulumiPath(TemplateDir)
 }
 
-// We are moving towards a world where these restrictions will be enforced by all our backends. When we get there,
-// we can consider removing this code in favor of exported functions in the backend package. For now, these are more
-// restrictive that what the backend enforces, but we want to "stop the bleeding" for new projects created via
-// `pulumi new`.
+// Naming rules are backend-specific. However, we provide baseline sanitization for project names
+// in this file. Though the backend may enforce stronger restrictions for a project name or description
+// further down the line.
 var (
-	stackOwnerRegexp          = regexp.MustCompile("^[a-zA-Z0-9][a-zA-Z0-9-_]{1,38}[a-zA-Z0-9]$")
-	stackNameAndProjectRegexp = regexp.MustCompile("^[A-Za-z0-9_.-]{1,100}$")
+	validProjectNameRegexp = regexp.MustCompile("^[A-Za-z0-9_.-]{1,100}$")
 )
 
 // ValidateProjectName ensures a project name is valid, if it is not it returns an error with a message suitable
@@ -411,7 +518,7 @@ func ValidateProjectName(s string) error {
 		return errors.New("A project name must be 100 characters or less")
 	}
 
-	if !stackNameAndProjectRegexp.MatchString(s) {
+	if !validProjectNameRegexp.MatchString(s) {
 		return errors.New("A project name may only contain alphanumeric, hyphens, underscores, and periods")
 	}
 
@@ -425,51 +532,6 @@ func ValidateProjectDescription(s string) error {
 
 	if len(s) > maxTagValueLength {
 		return errors.New("A project description must be 256 characters or less")
-	}
-
-	return nil
-}
-
-// ValidateStackName ensures a -- potentially qualified -- stack name is valid, if it is not it
-// returns an error with a message suitable for display to an end user.
-func ValidateStackName(s string) error {
-	// First, see if the stack name is qualified or not. It may be of the form "owner/name", when
-	// you have access to multiple organizations.
-	parts := strings.Split(s, "/")
-	switch len(parts) {
-	case 1:
-		return validateStackName(parts[0])
-	case 2:
-		if err := validateStackOwner(parts[0]); err != nil {
-			return err
-		}
-		return validateStackName(parts[1])
-	default:
-		return errors.New("A stack name may not contain slashes")
-	}
-}
-
-// validateStackOwner checks if a stack owner name is valid. An "owner" is simply the namespace
-// a stack may exist within, which for the Pulumi Service is the user account or organization.
-func validateStackOwner(s string) error {
-	// The error message takes a different from here, since stack names are created via the CLI,
-	// Pulumi organizations are created on the Pulumi Service. And so
-	if !stackOwnerRegexp.MatchString(s) {
-		return errors.New("Invalid stack owner")
-	}
-
-	return nil
-}
-
-// validateStackName checks if a stack name is valid, returning a user-suitable error if needed. May
-// need to be paired with validateOwnerName when checking a qualified stack reference.
-func validateStackName(s string) error {
-	if len(s) > 100 {
-		return errors.New("A stack name must be 100 characters or less")
-	}
-
-	if !stackNameAndProjectRegexp.MatchString(s) {
-		return errors.New("A stack name may only contain alphanumeric, hyphens, underscores, and periods")
 	}
 
 	return nil
@@ -536,7 +598,7 @@ func getValidProjectName(name string) string {
 
 // walkFiles is a helper that walks the directories/files in a source directory
 // and performs an action for each item.
-func walkFiles(sourceDir string, destDir string,
+func walkFiles(sourceDir string, destDir string, projectName string,
 	actionFn func(info os.FileInfo, source string, dest string) error) error {
 
 	contract.Require(sourceDir != "", "sourceDir")
@@ -562,7 +624,7 @@ func walkFiles(sourceDir string, destDir string,
 				return err
 			}
 
-			if err := walkFiles(source, dest, actionFn); err != nil {
+			if err := walkFiles(source, dest, projectName, actionFn); err != nil {
 				return err
 			}
 		} else {
@@ -571,7 +633,10 @@ func walkFiles(sourceDir string, destDir string,
 				continue
 			}
 
-			if err := actionFn(info, source, dest); err != nil {
+			// The file name may contain a placeholder for project name: replace it with the actual value.
+			newDest := transform(dest, projectName, "")
+
+			if err := actionFn(info, source, newDest); err != nil {
 				return err
 			}
 		}

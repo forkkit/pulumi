@@ -319,10 +319,15 @@ type SecretV1 struct {
 
 // ConfigValue describes a single (possibly secret) configuration value.
 type ConfigValue struct {
-	// String is either the plaintext value (for non-secrets) or the base64-encoded ciphertext (for secrets).
+	// When Object is false: String is either the plaintext value (for non-secrets) or the base64-encoded ciphertext
+	// (for secrets). When Object is true: String is a JSON encoded object. If both Object and Secret are true, then the
+	// object contains at least one secure value. Secure values in an object are encoded as `{"secure":"ciphertext"}`
+	// where ciphertext is the base64-encoded ciphertext.
 	String string `json:"string"`
 	// Secret is true if this value is a secret and false otherwise.
 	Secret bool `json:"secret"`
+	// Object is true if this value is a JSON encoded object.
+	Object bool `json:"object"`
 }
 
 // StackTagName is the key for the tags bag in stack. This is just a string, but we use a type alias to provide a richer
@@ -359,9 +364,17 @@ type Stack struct {
 	OrgName     string       `json:"orgName"`
 	ProjectName string       `json:"projectName"`
 	StackName   tokens.QName `json:"stackName"`
-
-	ActiveUpdate string                  `json:"activeUpdate"`
-	Tags         map[StackTagName]string `json:"tags,omitempty"`
+	// CurrentOperation provides information about a stack operation in-progress, as applicable.
+	CurrentOperation *OperationStatus        `json:"currentOperation,omitempty"`
+	ActiveUpdate     string                  `json:"activeUpdate"`
+	Tags             map[StackTagName]string `json:"tags,omitempty"`
 
 	Version int `json:"version"`
+}
+
+// OperationStatus describes the state of an operation being performed on a Pulumi stack.
+type OperationStatus struct {
+	Kind    UpdateKind `json:"kind"`
+	Author  string     `json:"author"`
+	Started int64      `json:"started"`
 }

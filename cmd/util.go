@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -54,6 +55,10 @@ import (
 
 func hasDebugCommands() bool {
 	return cmdutil.IsTruthy(os.Getenv("PULUMI_DEBUG_COMMANDS"))
+}
+
+func hasExperimentalCommands() bool {
+	return cmdutil.IsTruthy(os.Getenv("PULUMI_EXPERIMENTAL"))
 }
 
 func useLegacyDiff() bool {
@@ -119,6 +124,21 @@ func createStack(
 	} else if !isDefaultSecretsProvider {
 		// All other non-default secrets providers are handled by the cloud secrets provider which
 		// uses a URL schema to identify the provider
+
+		// Azure KeyVault never used to require an algorithm and there's no real reason to require it,
+		// but if someone specifies one, don't clobber it.
+		if strings.HasPrefix(secretsProvider, "azurekeyvault://") {
+			parsed, err := url.Parse(secretsProvider)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to parse secrets provider URL")
+			}
+
+			if parsed.Query().Get("algorithm") == "" {
+				parsed.Query().Set("algorithm", "RSA-OAEP-256")
+				secretsProvider = parsed.String()
+			}
+		}
+
 		if _, secretsErr := newCloudSecretsManager(stackRef.Name(), stackConfigFile, secretsProvider); secretsErr != nil {
 			return nil, secretsErr
 		}
@@ -126,8 +146,11 @@ func createStack(
 
 	stack, err := b.CreateStack(commandContext(), stackRef, opts)
 	if err != nil {
-		// If it's a StackAlreadyExistsError, don't wrap it.
+		// If it's a well-known error, don't wrap it.
 		if _, ok := err.(*backend.StackAlreadyExistsError); ok {
+			return nil, err
+		}
+		if _, ok := err.(*backend.OverStackLimitError); ok {
 			return nil, err
 		}
 		return nil, errors.Wrapf(err, "could not create stack")
@@ -206,6 +229,8 @@ func requireCurrentStack(offerNew bool, opts display.Options, setCurrent bool) (
 // true, then the option to create an entirely new stack is provided and will create one as desired.
 func chooseStack(
 	b backend.Backend, offerNew bool, opts display.Options, setCurrent bool) (backend.Stack, error) {
+	ctx := commandContext()
+
 	// Prepare our error in case we need to issue it.  Bail early if we're not interactive.
 	var chooseStackErr string
 	if offerNew {
@@ -224,7 +249,7 @@ func chooseStack(
 
 	// List stacks as available options.
 	project := string(proj.Name)
-	summaries, err := b.ListStacks(commandContext(), backend.ListStacksFilter{Project: &project})
+	summaries, err := b.ListStacks(ctx, backend.ListStacksFilter{Project: &project})
 	if err != nil {
 		return nil, errors.Wrapf(err, "could not query backend for stacks")
 	}
@@ -247,7 +272,7 @@ func chooseStack(
 
 	// If a stack is already selected, make that the default.
 	var current string
-	currStack, currErr := state.CurrentStack(commandContext(), b)
+	currStack, currErr := state.CurrentStack(ctx, b)
 	contract.IgnoreError(currErr)
 	if currStack != nil {
 		current = currStack.Ref().String()
@@ -298,9 +323,13 @@ func chooseStack(
 	if err != nil {
 		return nil, errors.Wrap(err, "parsing selected stack")
 	}
-	stack, err := b.GetStack(commandContext(), stackRef)
+	// GetStack may return (nil, nil) if the stack isn't found.
+	stack, err := b.GetStack(ctx, stackRef)
 	if err != nil {
 		return nil, errors.Wrap(err, "getting selected stack")
+	}
+	if stack == nil {
+		return nil, errors.Errorf("no stack named '%s' found", stackRef)
 	}
 
 	// If setCurrent is true, we'll persist this choice so it'll be used for future CLI operations.
@@ -313,24 +342,13 @@ func chooseStack(
 	return stack, nil
 }
 
-// projType represents the various types of Pulumi project. All Pulumi projects are denoted by a
-// Pulumi.yaml in the root of the workspace.
-type projType string
-
-const (
-	// pulumiAppProj is a Pulumi application project.
-	pulumiAppProj projType = "pulumi-app"
-	// pulumiPolicyProj is a Pulumi resource policy project.
-	pulumiPolicyProj projType = "pulumi-policy"
-)
-
 // parseAndSaveConfigArray parses the config array and saves it as a config for
 // the provided stack.
-func parseAndSaveConfigArray(s backend.Stack, configArray []string) error {
+func parseAndSaveConfigArray(s backend.Stack, configArray []string, path bool) error {
 	if len(configArray) == 0 {
 		return nil
 	}
-	commandLineConfig, err := parseConfig(configArray)
+	commandLineConfig, err := parseConfig(configArray, path)
 	if err != nil {
 		return err
 	}
@@ -341,10 +359,10 @@ func parseAndSaveConfigArray(s backend.Stack, configArray []string) error {
 	return nil
 }
 
-// readProject attempts to detect and read a project of type `projType` for the current workspace.
-// If the project is successfully detected and read, it is returned along with the path to its
-// containing directory, which will be used as the root of the project's Pulumi program.
-func readProject(projType projType) (*workspace.Project, string, error) {
+// readProject attempts to detect and read a Pulumi project for the current workspace. If the
+// project is successfully detected and read, it is returned along with the path to its containing
+// directory, which will be used as the root of the project's Pulumi program.
+func readProject() (*workspace.Project, string, error) {
 	pwd, err := os.Getwd()
 	if err != nil {
 		return nil, "", err
@@ -356,7 +374,9 @@ func readProject(projType projType) (*workspace.Project, string, error) {
 		return nil, "", errors.Wrapf(err, "failed to find current Pulumi project because of "+
 			"an error when searching for the Pulumi.yaml file (searching upwards from %s)", pwd)
 	} else if path == "" {
-		return nil, "", errReadProjNoPulumiYAML(projType, pwd)
+		return nil, "", fmt.Errorf(
+			"no Pulumi.yaml project file found (searching upwards from %s). If you have not "+
+				"created a project yet, use `pulumi new` to do so", pwd)
 	}
 	proj, err := workspace.LoadProject(path)
 	if err != nil {
@@ -366,16 +386,29 @@ func readProject(projType projType) (*workspace.Project, string, error) {
 	return proj, filepath.Dir(path), nil
 }
 
-func errReadProjNoPulumiYAML(projType projType, pwd string) error {
-	switch projType {
-	case pulumiPolicyProj:
-		return fmt.Errorf("no Pulumi.yaml project file found (searching upwards from %s)", pwd)
-
-	default:
-		return fmt.Errorf(
-			"no Pulumi.yaml project file found (searching upwards from %s). If you have not "+
-				"created a project yet, use `pulumi new` to do so", pwd)
+// readPolicyProject attempts to detect and read a Pulumi PolicyPack project for the current
+// workspace. If the project is successfully detected and read, it is returned along with the path
+// to its containing directory, which will be used as the root of the project's Pulumi program.
+func readPolicyProject() (*workspace.PolicyPackProject, string, error) {
+	pwd, err := os.Getwd()
+	if err != nil {
+		return nil, "", err
 	}
+
+	// Now that we got here, we have a path, so we will try to load it.
+	path, err := workspace.DetectPolicyPackPathFrom(pwd)
+	if err != nil {
+		return nil, "", errors.Wrapf(err, "failed to find current Pulumi project because of "+
+			"an error when searching for the PulumiPolicy.yaml file (searching upwards from %s)", pwd)
+	} else if path == "" {
+		return nil, "", fmt.Errorf("no PulumiPolicy.yaml project file found (searching upwards from %s)", pwd)
+	}
+	proj, err := workspace.LoadPolicyPack(path)
+	if err != nil {
+		return nil, "", errors.Wrapf(err, "failed to load Pulumi policy project located at %q", path)
+	}
+
+	return proj, filepath.Dir(path), nil
 }
 
 // anyWriter is an io.Writer that will set itself to `true` iff any call to `anyWriter.Write` is made with a
@@ -569,6 +602,7 @@ func addCIMetadataToEnvironment(env map[string]string) {
 	}
 	env[backend.CISystem] = string(vars.Name)
 	addIfSet(backend.CIBuildID, vars.BuildID)
+	addIfSet(backend.CIBuildNumer, vars.BuildNumber)
 	addIfSet(backend.CIBuildType, vars.BuildType)
 	addIfSet(backend.CIBuildURL, vars.BuildURL)
 	addIfSet(backend.CIPRHeadSHA, vars.SHA)

@@ -16,10 +16,12 @@ package engine
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/blang/semver"
+	"github.com/pkg/errors"
 	"github.com/pulumi/pulumi/pkg/diag"
 	"github.com/pulumi/pulumi/pkg/resource"
 	"github.com/pulumi/pulumi/pkg/resource/deploy"
@@ -43,11 +45,11 @@ type RequiredPolicy interface {
 
 // UpdateOptions contains all the settings for customizing how an update (deploy, preview, or destroy) is performed.
 //
-// This structre is embedded in another which uses some of the unexported fields, which trips up the `structcheck`
+// This structure is embedded in another which uses some of the unexported fields, which trips up the `structcheck`
 // linter.
 // nolint: structcheck
 type UpdateOptions struct {
-	// an optional set of paths of policy packs to run as part of this deployment.
+	// LocalPolicyPackPaths contains an optional set of paths to policy packs to run as part of this deployment.
 	LocalPolicyPackPaths []string
 
 	// RequiredPolicies is the set of policies that are required to run as part of the update.
@@ -65,11 +67,18 @@ type UpdateOptions struct {
 	// Specific resources to refresh during a refresh operation.
 	RefreshTargets []resource.URN
 
+	// Specific resources to replace during an update operation.
+	ReplaceTargets []resource.URN
+
 	// Specific resources to destroy during a destroy operation.
 	DestroyTargets []resource.URN
 
 	// Specific resources to update during an update operation.
 	UpdateTargets []resource.URN
+
+	// true if we're allowing dependent targets to change, even if not specified in one of the above
+	// XXXTargets lists.
+	TargetDependents bool
 
 	// true if the engine should use legacy diffing behavior during an update.
 	UseLegacyDiff bool
@@ -114,6 +123,8 @@ func Update(u UpdateInfo, ctx *Context, opts UpdateOptions, dryRun bool) (Resour
 	if err != nil {
 		return nil, result.FromError(err)
 	}
+	defer emitter.Close()
+
 	return update(ctx, info, planOptions{
 		UpdateOptions: opts,
 		SourceFunc:    newUpdateSource,
@@ -121,6 +132,13 @@ func Update(u UpdateInfo, ctx *Context, opts UpdateOptions, dryRun bool) (Resour
 		Diag:          newEventSink(emitter, false),
 		StatusDiag:    newEventSink(emitter, true),
 	}, dryRun)
+}
+
+// RunInstallPlugins calls installPlugins and just returns the error (avoids having to export pluginSet).
+func RunInstallPlugins(
+	proj *workspace.Project, pwd, main string, target *deploy.Target, plugctx *plugin.Context) error {
+	_, _, err := installPlugins(proj, pwd, main, target, plugctx)
+	return err
 }
 
 func installPlugins(
@@ -168,16 +186,34 @@ func installPlugins(
 	return allPlugins, defaultProviderVersions, nil
 }
 
-func installAndLoadPolicyPlugins(plugctx *plugin.Context, policies []RequiredPolicy) error {
+func installAndLoadPolicyPlugins(plugctx *plugin.Context, policies []RequiredPolicy, localPolicyPackPaths []string,
+	opts *plugin.PolicyAnalyzerOptions) error {
+
+	// Install and load required policy packs.
 	for _, policy := range policies {
 		policyPath, err := policy.Install(context.Background())
 		if err != nil {
 			return err
 		}
 
-		_, err = plugctx.Host.PolicyAnalyzer(tokens.QName(policy.Name()), policyPath)
+		_, err = plugctx.Host.PolicyAnalyzer(tokens.QName(policy.Name()), policyPath, opts)
 		if err != nil {
 			return err
+		}
+	}
+
+	// Load local policy packs.
+	for _, path := range localPolicyPackPaths {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+
+		analyzer, err := plugctx.Host.PolicyAnalyzer(tokens.QName(abs), path, opts)
+		if err != nil {
+			return err
+		} else if analyzer == nil {
+			return errors.Errorf("analyzer could not be loaded from path %q", path)
 		}
 	}
 
@@ -210,7 +246,19 @@ func newUpdateSource(
 	// Step 2: Install and load policy plugins.
 	//
 
-	if err := installAndLoadPolicyPlugins(plugctx, opts.RequiredPolicies); err != nil {
+	// Decrypt the configuration.
+	config, err := target.Config.Decrypt(target.Decrypter)
+	if err != nil {
+		return nil, err
+	}
+	analyzerOpts := plugin.PolicyAnalyzerOptions{
+		Project: proj.Name.String(),
+		Stack:   target.Name.String(),
+		Config:  config,
+		DryRun:  dryRun,
+	}
+	if err := installAndLoadPolicyPlugins(plugctx, opts.RequiredPolicies, opts.LocalPolicyPackPaths,
+		&analyzerOpts); err != nil {
 		return nil, err
 	}
 
@@ -233,6 +281,9 @@ func update(ctx *Context, info *planContext, opts planOptions, dryRun bool) (Res
 	policies := map[string]string{}
 	for _, p := range opts.RequiredPolicies {
 		policies[p.Name()] = p.Version()
+	}
+	for _, path := range opts.LocalPolicyPackPaths {
+		policies[path] = "(local)"
 	}
 
 	var resourceChanges ResourceChanges
@@ -337,7 +388,7 @@ func (acts *updateActions) OnResourceStepPost(
 		}
 
 		// Issue a true, bonafide error.
-		acts.Opts.Diag.Errorf(diag.GetPlanApplyFailedError(errorURN), err)
+		acts.Opts.Diag.Errorf(diag.GetResourceOperationFailedError(errorURN), err)
 		if reportStep {
 			acts.Opts.Events.resourceOperationFailedEvent(step, status, acts.Steps, acts.Opts.Debug)
 		}

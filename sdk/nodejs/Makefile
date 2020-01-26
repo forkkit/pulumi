@@ -1,6 +1,6 @@
 PROJECT_NAME     := Pulumi Node.JS SDK
 NODE_MODULE_NAME := @pulumi/pulumi
-VERSION          := $(shell ../../scripts/get-version)
+VERSION          := $(shell ../../scripts/get-version HEAD)
 
 LANGUAGE_HOST    := github.com/pulumi/pulumi/sdk/nodejs/cmd/pulumi-language-nodejs
 
@@ -35,8 +35,6 @@ build:: build_package build_plugin
 install_package::
 	cp dist/pulumi-resource-pulumi-nodejs "$(PULUMI_BIN)"
 	cp dist/pulumi-analyzer-policy "$(PULUMI_BIN)"
-	mkdir -p "$(PULUMI_BIN)/v6.10.2"
-	rm -rf "$(PULUMI_NODE_MODULES)/$(NODE_MODULE_NAME)/tests"
 
 install_plugin::
 	GOBIN=$(PULUMI_BIN) go install -ldflags "-X github.com/pulumi/pulumi/pkg/version.Version=${VERSION}" ${LANGUAGE_HOST}
@@ -44,14 +42,13 @@ install_plugin::
 install:: install_package install_plugin
 
 istanbul_tests::
-	istanbul test --print none _mocha -- --timeout 15000 'bin/tests/**/*.spec.js'
-	istanbul report text-summary
-	istanbul report text
+	./node_modules/.bin/istanbul test --print none _mocha -- --timeout 15000 'bin/tests/**/*.spec.js'
+	./node_modules/.bin/istanbul report text-summary
+	./node_modules/.bin/istanbul report text
 
 sxs_tests::
-# Intentionally disabled as PR https://github.com/pulumi/pulumi/pull/2609 breaks SxS
-# will be renabled once that goes in.
-#	pushd tests/sxs && yarn && tsc && popd
+	pushd tests/sxs_ts_3.6 && yarn && tsc && popd
+	pushd tests/sxs_ts_latest && yarn && tsc && popd
 
 test_fast:: sxs_tests istanbul_tests
 	$(GO_TEST_FAST) ${PROJECT_PKGS}

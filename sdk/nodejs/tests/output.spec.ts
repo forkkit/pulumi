@@ -15,7 +15,8 @@
 // tslint:disable
 
 import * as assert from "assert";
-import { Output, concat, interpolate, output, unknown } from "../output";
+import { Output, all, concat, interpolate, output, unknown } from "../output";
+import { Resource } from "../resource";
 import * as runtime from "../runtime";
 import { asyncTest } from "./util";
 
@@ -38,12 +39,36 @@ function mustCompile(): Output<Widget> {
     })
 }
 
+// mockOutput returns a value that looks like an Output, but allows for greater control over its behavior. This can be
+// used to simulate outputs from downlevel SDKs.
+function mockOutput(isKnown: boolean | Promise<boolean>, value: any | Promise<any>): any {
+    isKnown = isKnown instanceof Promise ? isKnown : Promise.resolve(isKnown);
+    value = value instanceof Promise ? value : Promise.resolve(value);
+
+    return {
+        __pulumiOutput: true,
+        isKnown: isKnown,
+        isSecret: Promise.resolve(false),
+        promise: () => value,
+        resources: () => new Set<Resource>(),
+
+        apply(callback: any): any {
+            return mockOutput(isKnown, value.then(async (v: any) => {
+                if (!isKnown) {
+                    return undefined;
+                }
+                return callback(v);
+            }));
+        }
+    }
+}
+
 describe("output", () => {
     it("propagates true isKnown bit from inner Output", asyncTest(async () => {
         runtime._setIsDryRun(true);
 
-        const output1 = new Output(new Set(), Promise.resolve("outer"), Promise.resolve(true), Promise.resolve(false));
-        const output2 = output1.apply(v => new Output(new Set(), Promise.resolve("inner"), Promise.resolve(true), Promise.resolve(false)));
+        const output1 = new Output(new Set(), Promise.resolve("outer"), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set()));
+        const output2 = output1.apply(v => new Output(new Set(), Promise.resolve("inner"), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set())));
 
         const isKnown = await output2.isKnown;
         assert.equal(isKnown, true);
@@ -55,8 +80,8 @@ describe("output", () => {
     it("propagates false isKnown bit from inner Output", asyncTest(async () => {
         runtime._setIsDryRun(true);
 
-        const output1 = new Output(new Set(), Promise.resolve("outer"), Promise.resolve(true), Promise.resolve(false));
-        const output2 = output1.apply(v => new Output(new Set(), Promise.resolve("inner"), Promise.resolve(false), Promise.resolve(false)));
+        const output1 = new Output(new Set(), Promise.resolve("outer"), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set()));
+        const output2 = output1.apply(v => new Output(new Set(), Promise.resolve("inner"), Promise.resolve(false), Promise.resolve(false), Promise.resolve(new Set())));
 
         const isKnown = await output2.isKnown;
         assert.equal(isKnown, false);
@@ -65,30 +90,32 @@ describe("output", () => {
         assert.equal(value, "inner");
     }));
 
-    it("can await even when isKnown is a rejected promise.", asyncTest(async () => {
+    it("can not await if isKnown is a rejected promise.", asyncTest(async () => {
         runtime._setIsDryRun(true);
 
-        const output1 = new Output(new Set(), Promise.resolve("outer"), Promise.resolve(true), Promise.resolve(false));
-        const output2 = output1.apply(v => new Output(new Set(), Promise.resolve("inner"), Promise.reject(new Error("foo")), Promise.resolve(false)));
+        const output1 = new Output(new Set(), Promise.resolve("outer"), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set()));
+        const output2 = output1.apply(v => new Output(new Set(), Promise.resolve("inner"), Promise.reject(new Error("foo")), Promise.resolve(false), Promise.resolve(new Set())));
 
-        const isKnown = await output2.isKnown;
-        assert.equal(isKnown, false);
+        try {
+            const isKnown = await output2.isKnown;
+            assert.fail("Should not reach here");
+        }
+        catch (err) {
+        }
 
         try {
             const value = await output2.promise();
+            assert.fail("Should not reach here");
         }
         catch (err) {
-            return;
         }
-
-        assert.fail("Should not read here");
     }));
 
     it("propagates true isSecret bit from inner Output", asyncTest(async () => {
         runtime._setIsDryRun(true);
 
-        const output1 = new Output(new Set(), Promise.resolve("outer"), Promise.resolve(true), Promise.resolve(false));
-        const output2 = output1.apply(v => new Output(new Set(), Promise.resolve("inner"), Promise.resolve(true), Promise.resolve(true)));
+        const output1 = new Output(new Set(), Promise.resolve("outer"), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set()));
+        const output2 = output1.apply(v => new Output(new Set(), Promise.resolve("inner"), Promise.resolve(true), Promise.resolve(true), Promise.resolve(new Set())));
 
         const isSecret = await output2.isSecret;
         assert.equal(isSecret, true);
@@ -100,8 +127,8 @@ describe("output", () => {
      it("retains true isSecret bit from outer Output", asyncTest(async () => {
         runtime._setIsDryRun(true);
 
-        const output1 = new Output(new Set(), Promise.resolve("outer"), Promise.resolve(true), Promise.resolve(true));
-        const output2 = output1.apply(v => new Output(new Set(), Promise.resolve("inner"), Promise.resolve(true), Promise.resolve(false)));
+        const output1 = new Output(new Set(), Promise.resolve("outer"), Promise.resolve(true), Promise.resolve(true), Promise.resolve(new Set()));
+        const output2 = output1.apply(v => new Output(new Set(), Promise.resolve("inner"), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set())));
 
         const isSecret = await output2.isSecret;
         assert.equal(isSecret, true);
@@ -111,8 +138,7 @@ describe("output", () => {
     }));
 
     describe("isKnown", () => {
-        function or<T>(output1: Output<T>, output2: Output<T>): Output<T>;
-        function or<T>(output1: any, output2: any): any {
+        function or<T>(output1: Output<T>, output2: Output<T>): Output<T> {
             const val1 = output1.promise();
             const val2 = output2.promise();
             return new Output<T>(
@@ -122,14 +148,16 @@ describe("output", () => {
                 Promise.all([val1, output1.isKnown, output2.isKnown])
                        .then(([val1, isKnown1, isKnown2]) => val1 ? isKnown1 : isKnown2),
                 Promise.all([val1, output1.isSecret, output2.isSecret])
-                       .then(([val1, isSecret1, isSecret2]) => val1 ? isSecret1 : isSecret2));
+                       .then(([val1, isSecret1, isSecret2]) => val1 ? isSecret1 : isSecret2),
+                Promise.all([output1.allResources!(), output2.allResources!()])
+                       .then(([r1, r2]) => new Set([...r1, ...r2])));
         }
 
         it("choose between known and known output, non-secret", asyncTest(async () => {
             runtime._setIsDryRun(true);
 
-            const o1 = new Output(new Set(), Promise.resolve("foo"), Promise.resolve(true), Promise.resolve(false));
-            const o2 = new Output(new Set(), Promise.resolve("bar"), Promise.resolve(true), Promise.resolve(false));
+            const o1 = new Output(new Set(), Promise.resolve("foo"), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set()));
+            const o2 = new Output(new Set(), Promise.resolve("bar"), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set()));
 
             const result = or(o1, o2);
 
@@ -146,8 +174,8 @@ describe("output", () => {
         it("choose between known and known output, secret", asyncTest(async () => {
             runtime._setIsDryRun(true);
 
-            const o1 = new Output(new Set(), Promise.resolve("foo"), Promise.resolve(true), Promise.resolve(true));
-            const o2 = new Output(new Set(), Promise.resolve("bar"), Promise.resolve(true), Promise.resolve(false));
+            const o1 = new Output(new Set(), Promise.resolve("foo"), Promise.resolve(true), Promise.resolve(true), Promise.resolve(new Set()));
+            const o2 = new Output(new Set(), Promise.resolve("bar"), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set()));
 
             const result = or(o1, o2);
 
@@ -164,8 +192,8 @@ describe("output", () => {
         it("choose between known and unknown output, non-secret", asyncTest(async () => {
             runtime._setIsDryRun(true);
 
-            const o1 = new Output(new Set(), Promise.resolve("foo"), Promise.resolve(true), Promise.resolve(false));
-            const o2 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false));
+            const o1 = new Output(new Set(), Promise.resolve("foo"), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set()));
+            const o2 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false), Promise.resolve(new Set()));
 
             const result = or(o1, o2);
 
@@ -182,8 +210,8 @@ describe("output", () => {
         it("choose between known and unknown output, secret", asyncTest(async () => {
             runtime._setIsDryRun(true);
 
-            const o1 = new Output(new Set(), Promise.resolve("foo"), Promise.resolve(true), Promise.resolve(true));
-            const o2 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false));
+            const o1 = new Output(new Set(), Promise.resolve("foo"), Promise.resolve(true), Promise.resolve(true), Promise.resolve(new Set()));
+            const o2 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false), Promise.resolve(new Set()));
 
             const result = or(o1, o2);
 
@@ -200,8 +228,8 @@ describe("output", () => {
         it("choose between unknown and known output, non-secret", asyncTest(async () => {
             runtime._setIsDryRun(true);
 
-            const o1 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false));
-            const o2 = new Output(new Set(), Promise.resolve("bar"), Promise.resolve(true), Promise.resolve(false));
+            const o1 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false), Promise.resolve(new Set()));
+            const o2 = new Output(new Set(), Promise.resolve("bar"), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set()));
 
             const result = or(o1, o2);
 
@@ -218,8 +246,8 @@ describe("output", () => {
         it("choose between unknown and known output, secret", asyncTest(async () => {
             runtime._setIsDryRun(true);
 
-            const o1 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false));
-            const o2 = new Output(new Set(), Promise.resolve("bar"), Promise.resolve(true), Promise.resolve(true));
+            const o1 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false), Promise.resolve(new Set()));
+            const o2 = new Output(new Set(), Promise.resolve("bar"), Promise.resolve(true), Promise.resolve(true), Promise.resolve(new Set()));
 
             const result = or(o1, o2);
 
@@ -236,8 +264,8 @@ describe("output", () => {
         it("choose between unknown and unknown output, non-secret", asyncTest(async () => {
             runtime._setIsDryRun(true);
 
-            const o1 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false));
-            const o2 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false));
+            const o1 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false), Promise.resolve(new Set()));
+            const o2 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false), Promise.resolve(new Set()));
 
             const result = or(o1, o2);
 
@@ -254,8 +282,8 @@ describe("output", () => {
         it("choose between unknown and unknown output, secret1", asyncTest(async () => {
             runtime._setIsDryRun(true);
 
-            const o1 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(true));
-            const o2 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false));
+            const o1 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(true), Promise.resolve(new Set()));
+            const o2 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false), Promise.resolve(new Set()));
 
             const result = or(o1, o2);
 
@@ -272,8 +300,8 @@ describe("output", () => {
         it("choose between unknown and unknown output, secret2", asyncTest(async () => {
             runtime._setIsDryRun(true);
 
-            const o1 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false));
-            const o2 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(true));
+            const o1 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(false), Promise.resolve(new Set()));
+            const o2 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(true), Promise.resolve(new Set()));
 
             const result = or(o1, o2);
 
@@ -290,8 +318,8 @@ describe("output", () => {
         it("choose between unknown and unknown output, secret3", asyncTest(async () => {
             runtime._setIsDryRun(true);
 
-            const o1 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(true));
-            const o2 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(true));
+            const o1 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(true), Promise.resolve(new Set()));
+            const o2 = new Output(new Set(), Promise.resolve(undefined), Promise.resolve(false), Promise.resolve(true), Promise.resolve(new Set()));
 
             const result = or(o1, o2);
 
@@ -308,9 +336,9 @@ describe("output", () => {
         it("is unknown if the value is or contains unknowns", asyncTest(async () => {
             runtime._setIsDryRun(true);
 
-            const o1 = new Output(new Set(), Promise.resolve(unknown), Promise.resolve(true), Promise.resolve(false));
-            const o2 = new Output(new Set(), Promise.resolve(["foo", unknown]), Promise.resolve(true), Promise.resolve(false));
-            const o3 = new Output(new Set(), Promise.resolve({"foo": "foo", unknown}), Promise.resolve(true), Promise.resolve(false));
+            const o1 = new Output(new Set(), Promise.resolve(unknown), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set()));
+            const o2 = new Output(new Set(), Promise.resolve(["foo", unknown]), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set()));
+            const o3 = new Output(new Set(), Promise.resolve({"foo": "foo", unknown}), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set()));
 
             assert.equal(await o1.isKnown, false);
             assert.equal(await o2.isKnown, false);
@@ -320,7 +348,7 @@ describe("output", () => {
         it("is unknown if the result after apply is unknown or contains unknowns", asyncTest(async () => {
             runtime._setIsDryRun(true);
 
-            const o1 = new Output(new Set(), Promise.resolve("foo"), Promise.resolve(true), Promise.resolve(false));
+            const o1 = new Output(new Set(), Promise.resolve("foo"), Promise.resolve(true), Promise.resolve(false), Promise.resolve(new Set()));
             const r1 = o1.apply(v => unknown);
             const r2 = o1.apply(v => [v, unknown]);
             const r3 = o1.apply(v => <any>{v, unknown});
@@ -442,37 +470,98 @@ describe("output", () => {
         }));
 
         it("lifts properties from values with nested unknowns", asyncTest(async () => {
-            const output1 = output({ foo: "foo", bar: unknown, baz: Promise.resolve(unknown) });
+            runtime._setIsDryRun(true);
 
+            const output1 = output({
+                foo: "foo",
+                bar: unknown,
+                baz: Promise.resolve(unknown),
+                qux: mockOutput(false, undefined),
+            });
             assert.equal(await output1.isKnown, false);
 
             const result1 = output1.foo;
             assert.equal(await result1.isKnown, true);
-            assert.equal(await result1.promise(), "foo");
+            assert.equal(await (<any>result1).promise(/*withUnknowns*/ true), "foo");
 
             const result2 = output1.bar;
             assert.equal(await result2.isKnown, false);
-            assert.equal(await result2.promise(), unknown);
+            assert.equal(await (<any>result2).promise(/*withUnknowns*/ true), unknown);
 
             const result3 = output1.baz;
             assert.equal(await result3.isKnown, false);
-            assert.equal(await result3.promise(), unknown);
+            assert.equal(await (<any>result3).promise(/*withUnknowns*/ true), unknown);
 
-            const result4 = (<any>output1.baz).qux;
+            const result4 = output1.qux;
             assert.equal(await result4.isKnown, false);
-            assert.equal(await result4.promise(), unknown);
+            assert.equal(await (<any>result4).promise(/*withUnknowns*/ true), unknown);
 
-            const output2 = output([ "foo", unknown ]);
+            const result5 = (<any>output1.baz).qux;
+            assert.equal(await result5.isKnown, false);
+            assert.equal(await (<any>result5).promise(/*withUnknowns*/ true), unknown);
 
+            const output2 = output([ "foo", unknown, mockOutput(false, undefined) ]);
             assert.equal(await output2.isKnown, false);
 
-            const result5 = output2[0];
-            assert.equal(await result5.isKnown, true);
-            assert.equal(await result5.promise(), "foo");
+            const result6 = output2[0];
+            assert.equal(await result6.isKnown, true);
+            assert.equal(await (<any>result6).promise(/*withUnknowns*/ true), "foo");
 
-            const result6 = output2[1];
-            assert.equal(await result6.isKnown, false);
-            assert.equal(await result6.promise(), unknown);
+            const result7 = output2[1];
+            assert.equal(await result7.isKnown, false);
+            assert.equal(await (<any>result7).promise(/*withUnknowns*/ true), unknown);
+
+            const result8 = output2[2];
+            assert.equal(await result8.isKnown, false);
+            assert.equal(await (<any>result8).promise(/*withUnknowns*/ true), unknown);
+
+            const output3 = all([ unknown, mockOutput(false, undefined), output([ "foo", unknown ])]);
+            assert.equal(await output3.isKnown, false);
+
+            const result9 = output3[0];
+            assert.equal(await result9.isKnown, false);
+            assert.equal(await (<any>result9).promise(/*withUnknowns*/ true), unknown);
+
+            const result10 = output3[1];
+            assert.equal(await result10.isKnown, false);
+            assert.equal(await (<any>result10).promise(/*withUnknowns*/ true), unknown);
+
+            const result11 = output3[2];
+            assert.equal(await result11.isKnown, false);
+
+            const result12 = (<any>result11)[0];
+            assert.equal(await result12.isKnown, true);
+            assert.equal(await (<any>result12).promise(/*withUnknowns*/ true), "foo");
+
+            const result13 = (<any>result11)[1];
+            assert.equal(await result13.isKnown, false);
+            assert.equal(await (<any>result13).promise(/*withUnknowns*/ true), unknown);
+
+            const output4 = all({
+                foo: unknown,
+                bar: mockOutput(false, undefined),
+                baz: output({ foo: "foo", qux: unknown }),
+            });
+            assert.equal(await output4.isKnown, false);
+
+            const result14 = output4.foo;
+            assert.equal(await result14.isKnown, false);
+            assert.equal(await (<any>result14).promise(/*withUnknowns*/ true), unknown);
+
+            const result15 = output4.bar;
+            assert.equal(await result15.isKnown, false);
+            assert.equal(await (<any>result15).promise(/*withUnknowns*/ true), unknown);
+
+            const result16 = output4.baz;
+            assert.equal(await result16.isKnown, false);
+
+            const result17 = (<any>result16).foo;
+            assert.equal(await result17.isKnown, true);
+            assert.equal(await (<any>result17).promise(/*withUnknowns*/ true), "foo");
+
+            const result18 = (<any>result16).qux;
+            assert.equal(await result18.isKnown, false);
+            assert.equal(await (<any>result18).promise(/*withUnknowns*/ true), unknown);
         }));
     });
 });

@@ -1,6 +1,6 @@
 PROJECT_NAME     := Pulumi Python SDK
 LANGHOST_PKG     := github.com/pulumi/pulumi/sdk/python/cmd/pulumi-language-python
-VERSION          := $(shell ../../scripts/get-py-version)
+VERSION          := $(shell ../../scripts/get-py-version HEAD)
 
 PYENV := ./env
 PYENVSRC := $(PYENV)/src
@@ -23,6 +23,7 @@ build_plugin::
 build:: build_package build_plugin
 
 lint::
+	pipenv run mypy ./lib/pulumi --config-file=mypy.ini
 	pipenv run pylint ./lib/pulumi --rcfile=.pylintrc
 	golangci-lint run
 

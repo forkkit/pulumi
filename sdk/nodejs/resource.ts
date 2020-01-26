@@ -13,9 +13,9 @@
 // limitations under the License.
 
 import { util } from "protobufjs";
-import { ResourceError, RunError } from "./errors";
-import { all, Input, Inputs, interpolate, Output, output } from "./output";
-import { getStackResource } from "./runtime";
+import { ResourceError } from "./errors";
+import { Input, Inputs, interpolate, Output, output } from "./output";
+import { getStackResource, unknownValue } from "./runtime";
 import { readResource, registerResource, registerResourceOutputs } from "./runtime/resource";
 import { getProject, getStack } from "./runtime/settings";
 import * as utils from "./utils";
@@ -220,6 +220,27 @@ export abstract class Resource {
             throw new ResourceError("Missing resource name argument (for URN creation)", opts.parent);
         }
 
+        // Before anything else - if there are transformations registered, invoke them in order to transform the properties and
+        // options assigned to this resource.
+        const parent = opts.parent || getStackResource() || { __transformations: undefined };
+        this.__transformations = [ ...(opts.transformations || []), ...(parent.__transformations || []) ];
+        for (const transformation of this.__transformations) {
+            const tres = transformation({ resource: this, type: t, name, props, opts });
+            if (tres) {
+                if (tres.opts.parent !== opts.parent) {
+                    // This is currently not allowed because the parent tree is needed to establish what
+                    // transformation to apply in the first place, and to compute inheritance of other
+                    // resource options in the Resource constructor before transformations are run (so
+                    // modifying it here would only even partially take affect).  It's theoretically
+                    // possible this restriction could be lifted in the future, but for now just
+                    // disallow re-parenting resources in transformations to be safe.
+                    throw new Error("Transformations cannot currently be used to change the `parent` of a resource.");
+                }
+                props = tres.props;
+                opts = tres.opts;
+            }
+        }
+
         this.__name = name;
 
         // Make a shallow clone of opts to ensure we don't modify the value passed in.
@@ -252,12 +273,12 @@ export abstract class Resource {
         }
 
         if (custom) {
-            const provider = (<CustomResourceOptions>opts).provider;
+            const provider = opts.provider;
             if (provider === undefined) {
                 if (opts.parent) {
                     // If no provider was given, but we have a parent, then inherit the
                     // provider from our parent.
-                    (<CustomResourceOptions>opts).provider = opts.parent.getProvider(t);
+                    opts.provider = opts.parent.getProvider(t);
                 }
             } else {
                 // If a provider was specified, add it to the providers map under this type's package so that
@@ -280,10 +301,6 @@ export abstract class Resource {
                 : convertToProvidersMap((<ComponentResourceOptions>opts).providers);
             this.__providers = { ...this.__providers, ...providers };
         }
-
-        // Combine transformations inherited from the parent with transformations provided in opts.
-        const parent = opts.parent || getStackResource() || { __transformations: undefined };
-        this.__transformations = [ ...(opts.transformations || []), ...(parent.__transformations || []) ];
 
         this.__protect = !!opts.protect;
 
@@ -684,6 +701,24 @@ export abstract class ProviderResource extends CustomResource {
     /** @internal */
     private readonly pkg: string;
 
+    /** @internal */
+    // tslint:disable-next-line: variable-name
+    public __registrationId?: string;
+
+    public static async register(provider: ProviderResource | undefined): Promise<string | undefined> {
+        if (provider === undefined) {
+            return undefined;
+        }
+
+        if (!provider.__registrationId) {
+            const providerURN = await provider.urn.promise();
+            const providerID = await provider.id.promise() || unknownValue;
+            provider.__registrationId = `${providerURN}::${providerID}`;
+        }
+
+        return provider.__registrationId;
+    }
+
     /**
      * Creates and registers a new provider resource for a particular package.
      *
@@ -708,13 +743,21 @@ export abstract class ProviderResource extends CustomResource {
  * level abstraction. The component resource itself is a resource, but does not require custom CRUD
  * operations for provisioning.
  */
-export class ComponentResource extends Resource {
+export class ComponentResource<TData = any> extends Resource {
     /**
      * @internal
      * A private field to help with RTTI that works in SxS scenarios.
      */
     // tslint:disable-next-line:variable-name
-    public readonly __pulumiComponentResource: boolean;
+    public readonly __pulumiComponentResource = true;
+
+    /** @internal */
+    // tslint:disable-next-line:variable-name
+    public readonly __data: Promise<TData>;
+
+    /** @internal */
+    // tslint:disable-next-line:variable-name
+    private __registered = false;
 
     /**
      * Returns true if the given object is an instance of CustomResource.  This is designed to work even when
@@ -733,11 +776,10 @@ export class ComponentResource extends Resource {
      *
      * @param t The type of the resource.
      * @param name The _unique_ name of the resource.
-     * @param unused [Deprecated].  Component resources do not communicate or store their properties
-     *               with the Pulumi engine.
+     * @param args Information passed to [initialize] method.
      * @param opts A bag of options that control this resource's behavior.
      */
-    constructor(type: string, name: string, unused?: Inputs, opts: ComponentResourceOptions = {}) {
+    constructor(type: string, name: string, args: Inputs = {}, opts: ComponentResourceOptions = {}) {
         // Explicitly ignore the props passed in.  We allow them for back compat reasons.  However,
         // we explicitly do not want to pass them along to the engine.  The ComponentResource acts
         // only as a container for other resources.  Another way to think about this is that a normal
@@ -747,28 +789,60 @@ export class ComponentResource extends Resource {
         // not correspond to a real piece of cloud infrastructure.  As such, changes to it *itself*
         // do not have any effect on the cloud side of things at all.
         super(type, name, /*custom:*/ false, /*props:*/ {}, opts);
-        this.__pulumiComponentResource = true;
+        this.__data = this.initializeAndRegisterOutputs(args);
     }
 
-    // registerOutputs registers synthetic outputs that a component has initialized, usually by
-    // allocating other child sub-resources and propagating their resulting property values.
-    // ComponentResources should always call this at the end of their constructor to indicate that
-    // they are done creating child resources.  While not strictly necessary, this helps the
-    // experience by ensuring the UI transitions the ComponentResource to the 'complete' state as
-    // quickly as possible (instead of waiting until the entire application completes).
+    /** @internal */
+    private async initializeAndRegisterOutputs(args: Inputs) {
+        const data = await this.initialize(args);
+        this.registerOutputs();
+        return data;
+    }
+
+    /**
+     * Can be overridden by a subclass to asynchronously initialize data for this Component
+     * automatically when constructed.  The data will be available immediately for subclass
+     * constructors to use.  To access the data use `.getData`.
+     */
+    protected async initialize(args: Inputs): Promise<TData> {
+        return <TData>undefined!;
+    }
+
+    /**
+     * Retrieves the data produces by [initialize].  The data is immediately available in a
+     * derived class's constructor after the `super(...)` call to `ComponentResource`.
+     */
+    protected getData(): Promise<TData> {
+        return this.__data;
+    }
+
+    /**
+     * registerOutputs registers synthetic outputs that a component has initialized, usually by
+     * allocating other child sub-resources and propagating their resulting property values.
+     *
+     * ComponentResources can call this at the end of their constructor to indicate that they are
+     * done creating child resources.  This is not strictly necessary as this will automatically be
+     * called after the `initialize` method completes.
+     */
     protected registerOutputs(outputs?: Inputs | Promise<Inputs> | Output<Inputs>): void {
+        if (this.__registered) {
+            return;
+        }
+
+        this.__registered = true;
         registerResourceOutputs(this, outputs || {});
     }
 }
 
 (<any>ComponentResource).doNotCapture = true;
 (<any>ComponentResource.prototype).registerOutputs.doNotCapture = true;
+(<any>ComponentResource.prototype).initialize.doNotCapture = true;
+(<any>ComponentResource.prototype).initializeAndRegisterOutputs.doNotCapture = true;
 
 /** @internal */
 export const testingOptions = {
     isDryRun: false,
 };
-
 
 /**
  * [mergeOptions] takes two ResourceOptions values and produces a new ResourceOptions with the
